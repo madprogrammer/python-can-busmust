@@ -1,5 +1,9 @@
 # python-can-busmust
 
+[![PyPI](https://img.shields.io/pypi/v/python-can-busmust)](https://pypi.org/project/python-can-busmust/)
+[![CI](https://github.com/madprogrammer/python-can-busmust/actions/workflows/ci.yml/badge.svg)](https://github.com/madprogrammer/python-can-busmust/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/madprogrammer/python-can-busmust?include_prereleases)](https://github.com/madprogrammer/python-can-busmust/releases)
+
 **Alpha release: 0.1.0a1. Not yet validated on physical hardware.**
 The software tests use simulated USB devices. APIs and firmware compatibility
 may change as real-adapter testing proceeds. This is an independent project,
@@ -192,6 +196,17 @@ Python version, bitrate/sample-point settings, and a minimal reproduction in
 [a GitHub issue](https://github.com/madprogrammer/python-can-busmust/issues).
 Start with `python examples/loopback.py`, then test a correctly terminated
 two-node bus. Internal loopback alone does not establish physical-bus operation.
+
+## Releases
+
+Published GitHub releases and prereleases trigger the release workflow: validate
+the version, run the CI matrix, build and check the wheel/source distribution,
+publish to PyPI, and attach those same files to the GitHub release. The current
+[GitHub releases](https://github.com/madprogrammer/python-can-busmust/releases)
+also provide direct wheel downloads.
+
+See [the release guide](https://github.com/madprogrammer/python-can-busmust/blob/main/docs/releasing.md)
+for the version/tag convention, dry runs, credentials, and retry instructions.
 
 ## License and provenance
 

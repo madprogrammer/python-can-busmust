@@ -1,0 +1,182 @@
+name: Publish release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to validate and build WITHOUT publishing
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install packaging
+      - name: Check tag, source version, and release status
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import ast
+          import json
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+          from packaging.version import Version
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          version = project["version"]
+          assert project["name"] == "python-can-busmust"
+          assert os.environ["RELEASE_TAG"] == f"v{version}", "Tag must equal v<package version>"
+          tree = ast.parse(Path("src/busmust/__init__.py").read_text())
+          source_version = next(ast.literal_eval(node.value) for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets))
+          assert source_version == version, "Package and pyproject versions disagree"
+          release = json.loads(subprocess.check_output([
+              "gh", "release", "view", os.environ["RELEASE_TAG"],
+              "--json", "isDraft,isPrerelease"], text=True))
+          assert not release["isDraft"], "Publish the GitHub release first"
+          assert release["isPrerelease"] == Version(version).is_prerelease, "Prerelease flag disagrees with version"
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"sha={sha}\nversion={version}\n")
+          print(f"Validated release {version} at {sha}")
+          PY
+
+  tests:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.sha }}
+
+  build:
+    needs: [validate, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - name: Build wheel and source archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Check installation of the built wheel
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import os
+          import can
+          import busmust
+          from importlib.metadata import version
+          assert version("python-can-busmust") == busmust.__version__ == os.environ["EXPECTED_VERSION"]
+          assert can.interfaces.BACKENDS["busmust"] == ("busmust", "BusMustBus")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  pypi:
+    if: github.event_name == 'release'
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/python-can-busmust/${{ needs.validate.outputs.version }}/
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-distributions
+          path: dist/
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist/
+          skip-existing: true
+          attestations: false
+          verbose: false
+
+  github-release:
+    needs: [validate, build, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-distributions
+          path: dist/
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Verify PyPI hashes before attaching the same files to GitHub
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          url = f"https://pypi.org/pypi/python-can-busmust/{os.environ['RELEASE_VERSION']}/json"
+          for attempt in range(12):
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      published = json.load(response)
+                  hashes = {f["filename"]: f["digests"]["sha256"] for f in published["urls"]}
+                  if all(path.name in hashes for path in Path("dist").iterdir()):
+                      break
+              except (urllib.error.URLError, TimeoutError):
+                  if attempt == 11:
+                      raise
+              time.sleep(5)
+          for path in Path("dist").iterdir():
+              assert hashes.get(path.name) == hashlib.sha256(path.read_bytes()).hexdigest(), (
+                  f"{path.name} differs from PyPI; existing release assets will not be overwritten")
+          PY
+      - name: Attach wheel and source archive to the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

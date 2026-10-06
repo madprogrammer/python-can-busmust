@@ -53,6 +53,77 @@ CAN interfaces before opening it with `detach_kernel_driver=True`. The default
 refuses to detach an active kernel driver; an explicitly detached driver is
 reattached when the last bus on that adapter shuts down.
 
+## Nix
+
+The flake provides a Python package, an interpreter containing the driver, a
+development shell, and a Python package overlay for Linux and macOS on x86_64
+and aarch64. `flake.lock` pins nixpkgs. Nixpkgs' PyUSB includes libusb and finds
+it by its store path, so no manual library-path configuration is needed.
+
+```sh
+# Use the driver and development tools without pip
+nix develop github:madprogrammer/python-can-busmust
+python -c 'import can; print(can.interfaces.BACKENDS["busmust"])'
+
+# Or just run Python with the installed driver
+nix shell github:madprogrammer/python-can-busmust#python
+
+# From a checkout: build, test, and verify plugin/libusb loading
+nix build
+nix flake check
+```
+
+To include it in another project's `devShell`, apply the overlay to that
+project's Python package set. Following the same nixpkgs input keeps Python
+and its dependencies consistent:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    busmust = {
+      url = "github:madprogrammer/python-can-busmust";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nixpkgs, busmust, ... }:
+    let
+      system = "x86_64-linux"; # Set to your host system.
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ busmust.overlays.default ];
+      };
+    in {
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [
+          (pkgs.python3.withPackages (ps: [
+            ps.busmust ps.can-isotp ps.cantools
+          ]))
+        ];
+      };
+    };
+}
+```
+
+`packages.<system>.default` (also named `busmust`) is a Python library;
+`packages.<system>.python` is the ready-to-use interpreter environment.
+The default development shell runs local `src/busmust` edits when entered from
+a checkout and includes pytest, build, twine, and Ruff. Run `python -m pytest`
+there to test changes.
+
+On NixOS, USB access still requires a host udev rule, for example:
+
+```nix
+services.udev.extraRules = ''
+  SUBSYSTEM=="usb", ATTR{idVendor}=="0810", MODE="0660", TAG+="uaccess"
+'';
+```
+
+This grants access to the active local login session; headless services need
+appropriate device/group permissions. A devShell does not change host USB
+permissions or detach an active kernel driver automatically.
+
 ## Send and receive
 
 ```python

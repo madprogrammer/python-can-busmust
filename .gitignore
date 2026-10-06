@@ -6,6 +6,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+result
+result-*
 
 # Local reference checkout and publishing credentials never belong in releases.
 bmsocketcan/

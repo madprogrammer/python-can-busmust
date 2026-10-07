@@ -16,7 +16,8 @@ def test_installed_plugin_configuration_and_cleanup(fake_usb):
     ) as bus:
         assert isinstance(bus, BusMustBus)
         assert bus.protocol == can.CanProtocol.CAN_FD
-        assert dev.controls[:6] == [
+        assert dev.controls[0] == (0xC0, 0xF1, 0, 0, 4)  # firmware version read
+        assert dev.controls[1:7] == [
             (0x40, 0xC0, 4, 1, b""),
             (0x40, 0xC2, 0, 1, bytes.fromhex("f401d0075750000000000000")),
             (0x40, 0xC8, 0, 1, b"\x01" + bytes(31)),
@@ -53,6 +54,109 @@ def test_discovery_and_selection(fake_usb):
         BusMustBus(serial="missing")
     with pytest.raises(ValueError, match="2 channels"):
         BusMustBus(channel=2, usb_address=2)
+
+
+def test_open_recovers_latched_bus_off(fake_usb):
+    dev, _ = fake_usb
+    dev.bus_off = True
+    dev.loopback = True
+    with can.Bus(interface="busmust", channel=0, fd=True, ignore_config=True) as bus:
+        burst = next(p for p, _ in dev.writes if len(p) == 4096)  # 256 dummy RTR frames
+        assert burst[:8] == struct.pack("<HHI", 0xF002, 8, 0)
+        assert burst[8:16] == struct.pack("<II", 0, 0x20)
+        bitrates = [bytes(d) for _, request, _, _, d in dev.controls if request == 0xC2]
+        assert struct.pack("<HH8B", 1000, 8000, 87, 75, 0, 0, 0, 0, 0, 0) in bitrates
+        assert struct.pack("<HH8B", 500, 2000, 87, 80, 0, 0, 0, 0, 0, 0) in bitrates
+        modes = [(value, index) for _, request, value, index, _ in dev.controls if request == 0xC0]
+        assert (2, 0) in modes and modes[-1] == (0, 0)  # loopback during recovery, FD after
+        assert not dev.bus_off
+        assert bus.recv(0) is None  # looped-back recovery dummies were drained
+        bus.send(can.Message(arbitration_id=0x42, is_fd=True, data=bytes(range(12))), timeout=0)
+        msg = bus.recv(1)
+        assert msg.arbitration_id == 0x42 and bytes(msg.data) == bytes(range(12))
+
+
+def test_open_fails_when_bus_off_survives_recovery(fake_usb):
+    dev, _ = fake_usb
+    dev.stuck_bus_off = True
+    with pytest.raises(can.CanInitializationError, match="bus-off"):
+        BusMustBus()
+    assert dev.claims == dev.releases == dev.disposals == 1
+
+
+def test_open_recovers_bus_off_via_firmware_command(fake_usb):
+    dev, _ = fake_usb
+    dev.fw_version = bytes([3, 1, 0, 0])  # Gen3 firmware: F5 recovery supported
+    dev.f5_recovers = True
+    dev.bus_off = True
+    dev.loopback = True
+    with can.Bus(interface="busmust", channel=0, ignore_config=True) as bus:
+        assert dev.f5_calls == 1
+        assert not any(len(packet) == 4096 for packet, _ in dev.writes)  # no dummies
+        bitrates = [bytes(d) for _, request, _, _, d in dev.controls if request == 0xC2]
+        assert struct.pack("<HH8B", 1000, 8000, 87, 75, 0, 0, 0, 0, 0, 0) not in bitrates
+        bus.send(can.Message(arbitration_id=1, is_extended_id=False, data=[1]), timeout=0)
+        assert bus.recv(1).data == b"\x01"
+
+
+def test_open_falls_back_when_firmware_recovery_fails(fake_usb):
+    dev, _ = fake_usb
+    dev.fw_version = bytes([3, 2, 0, 0])  # F5 supported (Gen3 >= 3.1) but ineffective
+    dev.bus_off = True
+    dev.loopback = True
+    with BusMustBus():
+        assert dev.f5_calls == 1
+        assert any(len(packet) == 4096 for packet, _ in dev.writes)
+        assert not dev.bus_off
+
+
+def test_send_fails_and_recovers_mid_session_bus_off(fake_usb):
+    dev, _ = fake_usb
+    dev.loopback = True
+    with BusMustBus() as bus:
+        dev.bus_off = True  # controller enters bus-off mid-session
+        with pytest.raises(can.CanOperationError, match="bus-off"):
+            bus.send(can.Message(arbitration_id=2, is_extended_id=False, data=[2]), timeout=0)
+        assert any(len(packet) == 4096 for packet, _ in dev.writes) is False
+        status = bus.recover_bus_off()
+        assert not status.bus_off
+        assert any(len(packet) == 4096 for packet, _ in dev.writes)
+        assert bus.recv(0) is None  # looped-back dummies were drained
+        bus.send(can.Message(arbitration_id=2, is_extended_id=False, data=[2]), timeout=0)
+        assert bus.recv(1).data == b"\x02"
+        assert bus.recover_bus_off().bus_off is False  # healthy no-op
+
+
+def test_send_auto_recovers_bus_off(fake_usb):
+    dev, _ = fake_usb
+    dev.loopback = True
+    with BusMustBus(auto_recover_bus_off=True) as bus:
+        dev.bus_off = True
+        bus.send(can.Message(arbitration_id=3, is_extended_id=False, data=[3]), timeout=0)
+        assert not dev.bus_off
+        assert bus.recv(1).data == b"\x03"
+    with pytest.raises(ValueError, match="auto_recover_bus_off"):
+        BusMustBus(auto_recover_bus_off="yes")
+
+
+def test_open_retries_recovery_until_bus_off_clears(fake_usb):
+    dev, _ = fake_usb
+    dev.bus_off = True
+    dev.recover_after_bursts = 3  # a deep bus-off needs several dummy bursts
+    dev.loopback = True
+    with BusMustBus() as bus:
+        assert sum(1 for packet, _ in dev.writes if len(packet) == 4096) == 3
+        assert not dev.bus_off
+        bus.send(can.Message(arbitration_id=5, is_extended_id=False, data=[5]), timeout=0)
+        assert bus.recv(1).data == b"\x05"
+
+
+def test_atexit_cleanup_survives_late_shutdown(fake_usb):
+    dev, _ = fake_usb
+    bus = BusMustBus()
+    transport._close_all_sessions()  # what atexit does when a script exits
+    bus.shutdown()  # python-can's exit hook then calls shutdown again
+    assert dev.claims == dev.releases == dev.disposals == 1
 
 
 def test_multichannel_dispatch_and_independent_close(fake_usb):
@@ -113,10 +217,10 @@ def test_echo_policy_and_request_bit(fake_usb):
 )
 def test_status(fake_usb, flag, state):
     dev, _ = fake_usb
-    status = bytearray(8)
-    status[flag], status[6], status[7] = 1, 42, 12
-    dev.status = status
     with BusMustBus() as bus:
+        status = bytearray(8)  # set after opening: runtime status, not open-time state
+        status[flag], status[6], status[7] = 1, 42, 12
+        dev.status = status
         assert bus.state == state
         assert bus.get_status().tx_error_counter == 42
         dev.short_status = True

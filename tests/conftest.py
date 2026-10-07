@@ -40,6 +40,12 @@ class FakeDevice:
         self.fail_control = None
         self.short_status = False
         self.status = bytes(8)
+        self.bus_off = False  # 0xD1 reports bus-off until a dummy-frame burst arrives
+        self.stuck_bus_off = False  # bus-off that no recovery can clear
+        self.recover_after_bursts = 1  # how many dummy bursts clearing bus-off takes
+        self.fw_version = bytes(4)  # zeros: older than every F5 threshold
+        self.f5_recovers = False  # F5 control clears bus_off when True
+        self.f5_calls = 0
         self.loopback = False
         self.bridge = False
         self.configurations = 0
@@ -71,6 +77,15 @@ class FakeDevice:
         if self.fail_control == (request, wIndex):
             raise usb.core.USBError("test control failure")
         if direction == 0xC0:
+            if request == 0xF1:
+                return self.fw_version
+            if request == 0xF5:
+                self.f5_calls += 1
+                if self.f5_recovers:
+                    self.bus_off = False
+                return b""
+            if request == 0xD1 and (self.bus_off or self.stuck_bus_off):
+                return b"\x01" + bytes(7)
             return self.status[:4] if self.short_status else self.status
         return len(data_or_wLength)
 
@@ -91,6 +106,10 @@ class FakeDevice:
         if self.write_error:
             raise self.write_error
         self.writes.append((bytes(packet), timeout))
+        if self.bus_off and not self.stuck_bus_off and len(packet) >= 4096:
+            self.recover_after_bursts -= 1  # recovery dummy bursts clear bus-off
+            if self.recover_after_bursts <= 0:
+                self.bus_off = False
         if self.loopback or self.bridge:
             header = struct.unpack_from("<H", packet)[0]
             channel = (header >> 8) & 0xF

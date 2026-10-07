@@ -3,17 +3,31 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import math
+import os
+import sys
 import threading
 import time
 from collections import deque
 
 import usb.core
 import usb.util
-from can import CanInitializationError, CanOperationError, CanTimeoutError
+from can import CanInitializationError, CanOperationError, CanTimeoutError, Message
 
-from .protocol import PRODUCTS, VID, Decoder, ProtocolError, TimestampClock
+from .protocol import (
+    BUSOFF_RECOVERY,
+    F5_MIN_FW,
+    GET_VERSION,
+    PRODUCTS,
+    VID,
+    Decoder,
+    ProtocolError,
+    TimestampClock,
+    bitrate_payload,
+    encode_message,
+)
 
 log = logging.getLogger(__name__)
 
@@ -88,12 +102,14 @@ class Session:
         self.write_lock = threading.Lock()
         self.stop = threading.Event()
         self.error = None
+        self.closed = False
         self.claimed = False
         self.detached = False
         self.thread = None
         self.decoder = Decoder()
         self.clock = TimestampClock()
         self.generation = PRODUCTS[dev.idProduct][2]
+        self.fw_version = 0
         try:
             try:
                 active = dev.is_kernel_driver_active(0)
@@ -129,6 +145,12 @@ class Session:
                     "Expected one bulk IN and OUT endpoint on USB interface 0"
                 )
             self.ep_in, self.ep_out = inputs[0], outputs[0]
+            try:
+                version = self.control(GET_VERSION, size=4)
+                self.fw_version = int.from_bytes(version, "big")
+            except usb.core.USBError as exc:
+                log.debug("Cannot read BUSMUST firmware version: %s", exc)
+                self.fw_version = 0
             self.thread = threading.Thread(target=self._read, name="busmust-usb-rx", daemon=True)
             self.thread.start()
         except Exception:
@@ -137,6 +159,8 @@ class Session:
 
     def control(self, request, value=0, channel=0, data=b"", size=None):
         with self.control_lock:
+            if self.stop.is_set():  # a closed session must never touch libusb again
+                raise CanOperationError("BUSMUST USB session is closed")
             result = self.dev.ctrl_transfer(
                 0xC0 if size is not None else 0x40,
                 request,
@@ -186,8 +210,10 @@ class Session:
     def _read(self):
         try:
             while not self.stop.is_set():
+                if sys.is_finalizing():  # PyUSB finalizers may free libusb mid-read
+                    return
                 try:
-                    data = self.dev.read(self.ep_in, 16 * 1024, timeout=50)
+                    data = self.dev.read(self.ep_in, 16 * 1024, timeout=10)
                 except usb.core.USBTimeoutError:
                     continue
                 for frame in self.decoder.feed(bytes(data)):
@@ -208,9 +234,17 @@ class Session:
                     inbox.fail(self.error)
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         self.stop.set()
         if self.thread:
-            self.thread.join()  # read() is bounded to 50 ms; never dispose under an active read.
+            self.thread.join(0.5)
+            if self.thread.is_alive():
+                # The reader is stuck inside libusb (possibly wedged by
+                # PyUSB's exit-time finalizers); release would race it.
+                log.warning("BUSMUST USB reader did not stop; leaving interface claimed")
+                return
         with self.write_lock, self.control_lock:
             if self.claimed:
                 try:
@@ -225,6 +259,55 @@ class Session:
                     log.warning("Could not restore USB kernel driver: %s", exc)
                 self.detached = False
             usb.util.dispose_resources(self.dev)
+
+
+def _bus_off(session, channel):
+    return bool(session.control(0xD1, channel=channel, size=8)[0])
+
+
+RECOVERY_ATTEMPTS = 8  # a deep bus-off (TEC/REC pegged) can need several passes
+
+
+def recover_bus_off(session, channel, bitrate_data, mode, attempts=RECOVERY_ATTEMPTS):
+    """Mirror BMAPI BM_RecoverBusOff().
+
+    Firmware-side recovery (control 0xF5) on Gen2/2.5 >= 2.6.0.0 and
+    Gen3 >= 3.1.0.0; otherwise, or when that fails to clear the state, the
+    reference bmcan_loopback_recovery(): reconfigure at 1 Mbit/s / 8 Mbit/s
+    in internal loopback, flush 256 dummy RTR frames, then restore the
+    requested bitrate and mode. Retries up to `attempts` times, like the
+    reference driver's restart poll. Returns True when the fallback ran at
+    least once (its looped-back dummies need draining); raises nothing.
+    """
+    fallback = False
+    for attempt in range(attempts):
+        if session.fw_version >= F5_MIN_FW.get(session.generation, 0):
+            session.control(BUSOFF_RECOVERY, channel=channel, size=0)
+            time.sleep(0.05)
+            if not _bus_off(session, channel):
+                return fallback
+            log.debug("channel %d: firmware recovery incomplete; using fallback", channel)
+        session.control(0xC0, 4, channel)  # configuration mode
+        session.control(0xC2, channel=channel, data=bitrate_payload(1_000_000, 8_000_000, 87, 75))
+        time.sleep(0.01)
+        session.control(0xC0, 2, channel)  # internal loopback
+        time.sleep(0.01)
+        dummy = encode_message(
+            Message(arbitration_id=0, is_extended_id=False, is_remote_frame=True, dlc=0), channel
+        )
+        session.write(dummy * 256, 1.0)
+        time.sleep(0.05)
+        session.control(0xC0, 4, channel)
+        session.control(0xC2, channel=channel, data=bitrate_data)
+        time.sleep(0.01)
+        session.control(0xC0, mode, channel)
+        time.sleep(0.01)  # firmware drops bulk TX sent while switching modes
+        fallback = True
+        if not _bus_off(session, channel):
+            return fallback
+        log.debug("channel %d bus-off survives recovery attempt %d", channel, attempt + 1)
+        time.sleep(0.1)
+    return fallback
 
 
 _sessions = {}
@@ -260,6 +343,16 @@ def open_channel(
                     raise session.error
                 session.channels[channel] = inbox
             session.control(0xC0, mode, channel)
+            time.sleep(0.01)  # firmware drops bulk TX sent while switching modes
+            if _bus_off(session, channel):
+                if recover_bus_off(session, channel, bitrate_data, mode):
+                    time.sleep(0.01)
+                    while inbox.get(0) is not None:  # discard looped-back recovery dummies
+                        pass
+                if _bus_off(session, channel):
+                    raise CanInitializationError(
+                        "BUSMUST adapter is stuck in bus-off; power-cycle it"
+                    )
             return session, inbox
         except Exception:
             close_channel(session, channel)
@@ -280,3 +373,30 @@ def close_channel(session, channel):
             if not session.channels:
                 _sessions.pop(device_key(session.dev), None)
                 session.close()
+
+
+def _close_all_sessions():
+    # Best-effort cleanup when a script exits without shutting its buses down.
+    # PyUSB's exit-time finalizers free libusb objects while daemon reader
+    # threads may still be inside the library, so USB cleanup is only safe
+    # once a session's reader has stopped; sessions whose reader is stuck are
+    # left untouched rather than crashed. Posthumous Bus.shutdown() calls fail
+    # cleanly through the session-closed guard in Session.control/write.
+    with _registry_lock:
+        for session in list(_sessions.values()):
+            session.stop.set()
+        for session in list(_sessions.values()):
+            if session.thread:
+                session.thread.join(0.25)
+                if session.thread.is_alive():
+                    continue
+            for channel in list(session.channels):
+                close_channel(session, channel)
+
+
+if hasattr(os, "register_atexit"):
+    # Runs before threading shutdown and PyUSB's weakref finalizers, which
+    # free libusb objects under daemon reader threads and crash the process.
+    os.register_atexit(_close_all_sessions)
+else:  # older interpreters: best-effort, see _close_all_sessions docstring
+    atexit.register(_close_all_sessions)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from dataclasses import dataclass
 
 import usb.core
@@ -12,6 +13,8 @@ from can import BusABC, BusState, CanInitializationError, CanOperationError, Can
 
 from . import transport
 from .protocol import PRODUCTS, bitrate_payload, encode_message
+
+_STATUS_PROBE_INTERVAL = 0.5
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class BusMustBus(BusABC):
         receive_own_messages=False,
         non_iso=False,
         one_shot=False,
+        auto_recover_bus_off=False,
         can_filters=None,
         rx_queue_size=10_000,
         detach_kernel_driver=False,
@@ -70,6 +74,8 @@ class BusMustBus(BusABC):
             raise ValueError("listen_only and loopback are mutually exclusive")
         if non_iso and not fd:
             raise ValueError("non_iso requires fd=True")
+        if not isinstance(auto_recover_bus_off, bool):
+            raise ValueError("auto_recover_bus_off must be True or False")
         if kwargs.get("timing") is not None:
             raise ValueError("explicit BitTiming is unsupported; use bitrate and sample_point")
         br = bitrate_payload(
@@ -77,6 +83,10 @@ class BusMustBus(BusABC):
         )
         self.channel = channel
         self.fd = fd
+        self._br = br
+        self._auto_recover = auto_recover_bus_off
+        self._recovery_lock = threading.Lock()
+        self._next_bus_off_probe = 0.0
         self._listen_only = listen_only
         self._receive_own = receive_own_messages
         self._mode = 3 if listen_only else 2 if loopback else 0 if fd else 6
@@ -102,9 +112,6 @@ class BusMustBus(BusABC):
             model, count, generation = PRODUCTS[dev.idProduct]
             if channel >= count:
                 raise ValueError(f"{model} has {count} channels (0..{count - 1})")
-            self.channel_info = (
-                f"BUSMUST {model} Gen{generation} USB {dev.bus}:{dev.address} channel {channel}"
-            )
             self._session, self._inbox = transport.open_channel(
                 dev,
                 channel,
@@ -114,6 +121,14 @@ class BusMustBus(BusABC):
                 receive_own_messages,
                 rx_queue_size,
                 detach_kernel_driver,
+            )
+            fw = self._session.fw_version
+            fw_text = (
+                f" fw {fw >> 24}.{(fw >> 16) & 0xFF}.{(fw >> 8) & 0xFF}.{fw & 0xFF}" if fw else ""
+            )
+            self.channel_info = (
+                f"BUSMUST {model} Gen{generation} USB {dev.bus}:{dev.address}"
+                f" channel {channel}{fw_text}"
             )
             super().__init__(channel=channel, can_filters=can_filters, **kwargs)
             self._is_shutdown = False  # BusABC before 4.4 does not set this itself.
@@ -132,10 +147,46 @@ class BusMustBus(BusABC):
         if self._session.error:
             raise self._session.error
 
+    def _probe_bus_off(self):
+        """Rate-limited controller health check: a bus-off channel must fail
+        sends instead of silently discarding them. Detection latency is
+        bounded by the probe interval, like the reference driver's 1 s poll."""
+        now = time.monotonic()
+        if now < self._next_bus_off_probe:
+            return False
+        self._next_bus_off_probe = now + _STATUS_PROBE_INTERVAL
+        return self.get_status().bus_off
+
+    def recover_bus_off(self) -> CanStatus:
+        """BMAPI BM_RecoverBusOff() equivalent: clear a latched bus-off state.
+
+        Recent firmware recovers itself (USB control 0xF5); older adapters
+        run the reference driver's loopback dummy-frame procedure, which
+        briefly disturbs a shared bus at 1/8 Mbit/s. No-op when healthy;
+        raises CanOperationError when bus-off survives recovery.
+        """
+        self._check_open()
+        with self._recovery_lock:
+            status = self.get_status()
+            if not status.bus_off:
+                return status
+            fallback = transport.recover_bus_off(self._session, self.channel, self._br, self._mode)
+            if fallback:
+                while self._inbox.get(0) is not None:  # discard looped-back dummies
+                    pass
+            status = self.get_status()
+            if status.bus_off:
+                raise CanOperationError("BUSMUST adapter is stuck in bus-off; power-cycle it")
+            self._next_bus_off_probe = time.monotonic() + _STATUS_PROBE_INTERVAL
+            return status
+
     def send(self, msg, timeout=None):
         """Submit a frame to USB; successful return does not imply CAN ACK.
 
-        timeout is seconds (None: 1-second USB bound, 0: minimum 1 ms).
+        timeout is seconds (None: 1-second USB bound, 0: minimum 1 ms). A
+        rate-limited status probe turns a bus-off controller into
+        CanOperationError, or into a recovery plus one retry when
+        auto_recover_bus_off was enabled.
         """
         self._check_open()
         if self._listen_only:
@@ -144,6 +195,12 @@ class BusMustBus(BusABC):
             raise ValueError("CAN FD transmission requires fd=True")
         if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
             raise ValueError("timeout must be finite and nonnegative")
+        if self._probe_bus_off():
+            if not self._auto_recover:
+                raise CanOperationError(
+                    "BUSMUST controller is in bus-off; call recover_bus_off() or reopen"
+                )
+            self.recover_bus_off()
         self._session.write(encode_message(msg, self.channel, self._receive_own), timeout)
 
     def _recv_internal(self, timeout):

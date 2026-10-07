@@ -40,7 +40,10 @@ percentages; this backend does the same and documents it.
 
 Open sequence: configuration mode (`4`), bitrate, 10 ms settling delay, a basic
 accept-all filter in slot 0, invalid filter in slot 1, optional termination,
-then operating mode. Basic mode values: normal FD `0`, internal loopback `2`,
+then operating mode, followed by another 10 ms settle: measured on an X1
+(firmware 2.2.4.10), the firmware silently discards bulk frames submitted
+while the controller is still switching into the new mode. Basic mode values:
+normal FD `0`, internal loopback `2`,
 listen-only `3`, Classical CAN `6`. Non-ISO (`8`) and one-shot (`16`) are ORed
 into the mode. Close returns the selected channel to configuration mode.
 No persistent configuration is saved. Existing RX filters on that channel
@@ -48,6 +51,17 @@ are replaced; software filtering in `BusABC` supplies arbitrary filter lists.
 
 Status bytes: bus-off, reserved, TX passive, RX passive, TX warning, RX warning,
 TX error counter, RX error counter. `state` reads this status on demand.
+Gen2/2.5 firmware occasionally latches a stale bus-off state across a
+reconfiguration (observed on about 4% of channel opens with X1 firmware
+2.2.4.10); a deep latch can show TEC/REC pegged at 255 and survive several
+recovery passes. `recover_bus_off()` mirrors BMAPI `BM_RecoverBusOff()`:
+control `0xF5` performs the recovery in firmware on Gen2/2.5 >= 2.6.0.0 and
+Gen3 >= 3.1.0.0; older adapters use the reference `bmcan_loopback_recovery()`
+(a 1 Mbit/s / 8 Mbit/s internal-loopback burst of 256 dummy RTR frames, then
+restore), retried up to eight times like the reference driver's restart poll.
+Channel open runs it automatically when the controller comes up bus-off;
+`send()` probes status at most twice a second so a bus-off controller fails
+sends with `CanOperationError` instead of silently discarding frames.
 
 ## CAN envelope
 

@@ -4,9 +4,9 @@
 [![CI](https://github.com/madprogrammer/python-can-busmust/actions/workflows/ci.yml/badge.svg)](https://github.com/madprogrammer/python-can-busmust/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/madprogrammer/python-can-busmust?include_prereleases)](https://github.com/madprogrammer/python-can-busmust/releases)
 
-**Alpha release: 0.1.0a1. Not yet validated on physical hardware.**
-The software tests use simulated USB devices. APIs and firmware compatibility
-may change as real-adapter testing proceeds. This is an independent project,
+**Release 0.1.0, validated on physical hardware** (two X1 adapters, firmware
+2.2.4.10, wired together; see the changelog for the coverage matrix). The
+automated tests use simulated USB devices. This is an independent project,
 not an official BUSMUST release.
 
 A native Python/PyUSB driver for BUSMUST USB CAN and CAN FD adapters. It talks
@@ -198,6 +198,7 @@ smoke test. No hardware transmissions are needed to run the automated tests.
 | `receive_own_messages` | `False` | Request and deliver firmware TX echoes as `is_rx=False` |
 | `non_iso` | `False` | Non-ISO CAN FD mode; requires `fd=True` |
 | `one_shot` | `False` | Disable firmware automatic retransmission |
+| `auto_recover_bus_off` | `False` | Detect bus-off on send and recover, then retry once |
 | `can_filters` | `None` | Standard python-can software filters |
 | `rx_queue_size` | `10_000` | Maximum buffered frames per channel |
 | `detach_kernel_driver` | `False` | Explicitly allow temporary USB interface detachment |
@@ -208,8 +209,9 @@ Validation checks the wire format's range; firmware determines supported rates.
 
 ## Supported device IDs
 
-All use USB vendor ID `0810`. These are the reference implementation's mappings;
-listing an ID is not a claim of hardware validation.
+All use USB vendor ID `0810`. These are the reference implementation's mappings.
+The X1 (product ID `F012`, firmware 2.2.4.10) is validated on hardware; other
+models follow the same protocol but are not yet bench-tested.
 
 | Generation | Product | Product ID | CAN channels |
 | --- | --- | --- | --- |
@@ -238,13 +240,25 @@ listing an ID is not a claim of hardware validation.
   silently dropping frames. Reopen failed channels; reconnect all channels
   after a USB session failure. Stop `Notifier` before shutting down its bus.
 - Status flags/counters are available through `get_status()` and `bus.state`.
-  This driver does not synthesize SocketCAN error frames or implement the
-  kernel driver's firmware-specific bus-off recovery procedures.
+  Channels that come up latched in bus-off are recovered automatically at
+  open. Mid-session, `send()` probes the controller at most twice a second
+  and raises `CanOperationError` instead of silently discarding frames while
+  bus-off; `recover_bus_off()` (the BMAPI `BM_RecoverBusOff` equivalent)
+  clears the state — firmware-side on Gen2/2.5 ≥ 2.6.0.0 and Gen3 ≥ 3.1.0.0,
+  otherwise via the reference loopback dummy-frame procedure, which briefly
+  disturbs a shared bus at 1/8 Mbit/s and can need several passes. Passing
+  `auto_recover_bus_off=True` runs that recovery and retries the send once.
+  SocketCAN error frames are not synthesized.
+- Prefer context managers or explicit `shutdown()`. Exiting a process with
+  open channels is cleaned up best-effort, but PyUSB's exit-time finalizers
+  can race the background reader thread inside libusb and abort the process
+  during teardown; that race is beyond this driver's control.
 - Hardware TX tasks, routes, offline logging/replay, persistent configuration,
   PTP synchronization, and hardware acceptance-filter optimization are outside
   this implementation. Periodic sending and filtering run in Python.
-- No physical adapter validation or throughput guarantees are claimed. Firmware
-  echo behavior and cross-platform backend setup need hardware verification.
+- Hardware validation covers the X1 (Gen2, firmware 2.2.4.10); behavior on
+  other models, firmware generations, and non-Linux platforms is expected to
+  follow the reference protocol but is not yet bench-verified.
 
 ## Development and hardware feedback
 

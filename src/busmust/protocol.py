@@ -28,6 +28,11 @@ PRODUCTS = {
     0x0043: ("XL2", 2, 3),
     0x0083: ("XL4", 4, 3),
 }
+GET_VERSION = 0xF1
+BUSOFF_RECOVERY = 0xF5
+# BM_RecoverBusOff is firmware-side from these versions on; older adapters
+# need the reference driver's loopback + dummy-frame fallback.
+F5_MIN_FW = {2: 0x02060000, 2.5: 0x02060000, 3: 0x03010000}
 LENGTHS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64)
 HEADER = struct.Struct("<HHI")
 IDE, RTR, BRS, FDF, ESI, ECHO = 0x10, 0x20, 0x40, 0x80, 0x100, 0x20000
